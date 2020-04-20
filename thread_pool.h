@@ -1,81 +1,63 @@
 #pragma once
 
-/**
- * @file thread_pool.h
- * @class thread_pool
- * @description class thread_pool
- * @author Levon Ghukasyan
- */
-
-#include <mutex>
-#include <thread>
 #include <condition_variable>
-
-#include <type_traits>
-#include <future>
 #include <functional>
-
+#include <future>
+#include <mutex>
 #include <queue>
+#include <thread>
 #include <vector>
 
-
-template <typename Task>
 class thread_pool
 {
 public:
-    /// @brief constructor
-    explicit thread_pool(unsigned thread_count = 0);
-
-    /// @brief destrcutor
+    explicit thread_pool(int thread_count = 0);
     ~thread_pool();
 
-public:
-    /// @brief function to shedule tasks
-    template <class... Args>
-    auto shedule(Task&& function, Args&&... args) -> std::future<typename std::result_of<Task(Args...)>::type>;
+    thread_pool(const thread_pool&) = delete;
+    thread_pool& operator=(const thread_pool&) = delete;
+    thread_pool(thread_pool&&) = delete;
+    thread_pool& operator=(thread_pool&&) = delete;
+
+    template <typename Func, typename ... Args>
+    auto schedule(Func&& func, Args&& ... args);
 
 private:
-    bool m_stop;
-
-    std::condition_variable m_condition;
-
-    std::mutex m_mutex;
-
-    std::queue<Task> m_tasks;
-
     std::vector<std::thread> m_threads;
+    std::queue<std::packaged_task<void()>> m_tasks;
+    std::mutex m_mutex;
+    std::condition_variable m_condition;
+    bool m_stop{false};
 };
 
-template <typename Task>
-thread_pool<Task>::thread_pool(unsigned thread_count)
-    : m_stop{false}
+thread_pool::thread_pool(int thread_count)
 {
+    auto routine = [this] () {
+        while (true) {
+            std::packaged_task<void()> tsk;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                while (!m_stop && m_tasks.empty()) {
+                    m_condition.wait(lock);
+                }
+                if (m_stop && m_tasks.empty()) {
+                    return;
+                }
+                tsk = std::move(m_tasks.front());
+                m_tasks.pop();
+            }
+            tsk();
+        }
+    };
     if (thread_count == 0) {
         thread_count = std::thread::hardware_concurrency();
     }
-    for (unsigned i = 0; i < thread_count; ++i) {
-        m_threads.emplace_back([this] {
-            while(true) {
-                Task tsk;
-                {
-                    std::unique_lock<std::mutex> lock(m_mutex);
-                    while (!m_stop && m_tasks.empty()) {
-                        m_condition.wait(lock);
-                    }
-                    if (m_stop && m_tasks.empty()) {
-                        return;
-                    }
-                    tsk = std::move(m_tasks.front());
-                    m_tasks.pop();
-                }
-                tsk();
-            }
-        });
+    for (int i = 0; i < thread_count; ++i) {
+        m_threads.emplace_back(routine);
     }
 }
 
-template <typename Task>
-thread_pool<Task>::~thread_pool()
+thread_pool::~thread_pool()
 {
     {
         std::unique_lock<std::mutex> lock(m_mutex);
@@ -83,35 +65,22 @@ thread_pool<Task>::~thread_pool()
     }
 
     m_condition.notify_all();
-    for (auto& iter : m_threads) {
-        iter.join();
+    for (auto& thread : m_threads) {
+        thread.join();
     }
 }
 
-template <typename Task>
-template <class... Args>
-auto thread_pool<Task>::shedule(Task&& function, Args&&... args) -> std::future<typename std::result_of<Task(Args...)>::type>
+template <typename Func, typename ... Args>
+auto thread_pool::schedule(Func&& func, Args&& ... args)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if(m_stop) {
-        throw std::runtime_error("shedule on destroyed sheduler");
+    if (m_stop) { 
+        throw std::runtime_error("Schedule on destroyed scheduler.");
     }
-    using result_type = typename std::result_of<Task(Args...)>::type;
-
-    auto task = std::make_shared< std::packaged_task<result_type()> >(
-            std::bind(std::forward<Task>(function), std::forward<Args>(args)...)
-         );
-
-    std::future<result_type> result(task->get_future());
-    {
-        std::unique_lock<std::mutex> lock(m_mutex);
-
-        if(m_stop)
-            throw std::runtime_error("enqueue on stopped ThreadPool");
-
-        m_tasks.emplace([task](){ (*task)(); });
-    }
+    using ResultT = std::invoke_result_t<Func, Args ...>;
+    std::packaged_task<ResultT()> packaged_task{std::bind(std::forward<Func>(func), std::forward<Args>(args)...)};
+    auto future = packaged_task.get_future();
+    m_tasks.emplace(std::move(packaged_task));
     m_condition.notify_one();
-
-    return result;
+    return future;
 }
